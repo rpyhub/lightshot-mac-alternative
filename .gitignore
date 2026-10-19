@@ -1,0 +1,7 @@
+# macOS
+.DS_Store
+
+# derleme çıktıları
+LightShot.app/
+dist/
+*.dSYM/
