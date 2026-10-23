@@ -6,7 +6,7 @@
 set -e
 cd "$(dirname "$0")"
 APP=LightShot.app
-VERSION=1.0.0
+VERSION=1.0.1
 rm -rf "$APP"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # Xcode lisansı onaylı değilse Command Line Tools ile derle
 [ -d /Library/Developer/CommandLineTools ] && export DEVELOPER_DIR=/Library/Developer/CommandLineTools

@@ -110,6 +110,7 @@ All shortcuts, the upload host, link format, image format, auto-save folder and 
 ```bash
 ./tests/run.sh        # AWS signature vectors, scroll stitching, OCR, memory leak check, ...
 ./scripts/make_icon.sh   # regenerate the app icon
+./scripts/release.sh     # build, install and zip for a GitHub release (dist/)
 ```
 
 | File | What it does |

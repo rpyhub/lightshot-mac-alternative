@@ -604,6 +604,7 @@ final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             self.handle(action, shot, r)
         }
         self.session = session
+        _ = session.sideSize; _ = session.bottomSize   // araç çubuğu boyutlarını sürüklemeden önce hesapla (ilk fare olayı takılmasın)
         let mouse = NSEvent.mouseLocation
         session.cursor = NSPoint(x: mouse.x - U.minX, y: mouse.y - U.minY)
         session.hoverRect = session.windowRects.first { $0.contains(session.cursor!) }
@@ -622,6 +623,7 @@ final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             w.makeFirstResponder(v)
             overlays.append(w)
         }
+        session.redraw()   // ilk karartma / pencere vurgusu / büyüteç katmanlara yansısın
         if preselect, let l = defaults.array(forKey: "lastRect") as? [Double], l.count == 4 {
             let r = NSRect(x: l[0] - U.minX, y: l[1] - U.minY, width: l[2], height: l[3]).intersection(session.ub)
             if !r.isNull, r.width > 3, r.height > 3 { session.sel = r; session.layoutBars(); session.redraw() }

@@ -124,6 +124,7 @@ final class OverlayWindow: NSWindow {
 final class Session: NSObject, NSTextFieldDelegate {
     let full: NSImage      // tüm ekranların birleştirilmiş görüntüsü (nokta boyutu = U.size)
     let fullRep: NSBitmapImageRep?
+    let fullCG: CGImage?   // GPU'ya yüklenen ve büyüteç/renk için örneklenen ham görüntü
     let U: NSRect          // ekranların global birleşimi
     let scale: CGFloat     // çıktı piksel yoğunluğu (en yüksek ekran ölçeği)
     var ub: NSRect { NSRect(origin: .zero, size: U.size) }
@@ -154,12 +155,15 @@ final class Session: NSObject, NSTextFieldDelegate {
     var toolButtons: [Tool: NSButton] = [:]
     var colorButton: NSButton!
     let sizeLabel = NSTextField(labelWithString: "")
+    lazy var sideSize = sideBar.fittingSize       // çubuk boyutları sabit: her fare olayında Auto Layout çözülmesin
+    lazy var bottomSize = bottomBar.fittingSize
     // "upload" | "search" | "ocr" | "pin" | "record" | "scroll" | "print" | "copy" | "save" | "close"; üçüncü parametre seçimin global dikdörtgeni
     var onAction: ((String, Shot?, NSRect?) -> Void)!
 
     init(full: NSImage, U: NSRect, scale: CGFloat) {
         self.full = full; self.U = U; self.scale = scale
         fullRep = full.representations.first as? NSBitmapImageRep
+        fullCG = fullRep?.cgImage ?? full.cgImage(forProposedRect: nil, context: nil, hints: nil)
         super.init()
         sizeLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
         sizeLabel.textColor = .white; sizeLabel.drawsBackground = true
@@ -218,52 +222,51 @@ final class Session: NSObject, NSTextFieldDelegate {
         return s
     }
 
-    func redraw() { views.forEach { $0.needsDisplay = true } }
+    // MARK: Katmanlar (GPU)
+    // Ekran görüntüsü her ekranın görünümünde BİR KEZ katman içeriği olarak yüklenir; karartma, çerçeve ve tutamaçlar vektör katmanıdır.
+    // Seçim değişince sadece katman yolları güncellenir: büyük görüntü hiç yeniden çizilmez (ve eski parça kalması mümkün olmaz).
 
-    func invalidateLoupe(around c: NSPoint) { invalidate(NSRect(x: c.x - 210, y: c.y - 210, width: 420, height: 420)) }
+    func redraw() { syncChrome(); shapesChanged(); updateLoupe() }
 
-    // Yerel koordinattaki bir alanı ilgili ekranların görünümlerinde yeniden çizdirir
-    func invalidate(_ r: NSRect) {
+    func syncChrome() {
+        let has = sel.width > 3 && sel.height > 3
+        let handles = has ? handleDirs.map { d -> NSRect in let h = handlePoint(d); return NSRect(x: h.x - 4, y: h.y - 4, width: 8, height: 8) } : []
+        for v in views { v.apply(sel: sel, hover: hoverRect, handles: handles) }
+    }
+
+    // Çizimleri sadece değişen bölgede (yerel koordinat) ya da tamamen yeniden çizdirir
+    func shapesChanged(_ r: NSRect? = nil) {
         for v in views {
+            guard let r else { v.shapesView.needsDisplay = true; continue }
             let i = r.intersection(v.localFrame)
-            if !i.isNull, !i.isEmpty { v.setNeedsDisplay(i.offsetBy(dx: -v.off.x, dy: -v.off.y)) }
+            if !i.isNull, !i.isEmpty { v.shapesView.setNeedsDisplay(i.offsetBy(dx: -v.off.x, dy: -v.off.y)) }
         }
     }
 
-    // MARK: Çizim (her ekran kendi parçasını çizer)
-
-    func draw(_ v: OverlayView) {
-        let vr = v.localFrame
+    func drawShapes(offset o: NSPoint) {
         NSGraphicsContext.saveGraphicsState()
-        let t = NSAffineTransform(); t.translateX(by: -vr.minX, yBy: -vr.minY); t.concat()
-        full.draw(in: vr, from: vr, operation: .copy, fraction: 1)
-        let hole = sel.width > 0 ? sel : (hoverRect ?? .zero)
-        let dim = NSBezierPath(rect: vr); dim.appendRect(hole); dim.windingRule = .evenOdd
-        NSColor.black.withAlphaComponent(0.45).set(); dim.fill()
-        if sel.width <= 0, let h = hoverRect {   // pencere seçimi önizlemesi
-            NSColor.systemBlue.setStroke(); let b = NSBezierPath(rect: h.insetBy(dx: 1.5, dy: 1.5)); b.lineWidth = 3; b.stroke()
+        let t = NSAffineTransform(); t.translateX(by: -o.x, yBy: -o.y); t.concat()
+        shapes.forEach { $0.draw(bg: full, bounds: ub) }
+        if let c = current {
+            if c.tool == .blur {   // sürüklerken pikselleştirmeyi her olayda yeniden hesaplama (~20 ms): hafif önizleme, fare bırakılınca asıl bulanıklaştırma
+                let r = rectFrom(c.pts[0], c.pts.last!)
+                NSColor(white: 1, alpha: 0.18).setFill(); NSBezierPath(rect: r).fill()
+                let d = NSBezierPath(rect: r); d.setLineDash([5, 4], count: 2, phase: 0); NSColor.white.setStroke(); d.stroke()
+            } else { c.draw(bg: full, bounds: ub) }
         }
-        if sel.width > 0 {
-            NSGraphicsContext.saveGraphicsState()
-            NSBezierPath(rect: sel).setClip()
-            (shapes + (current.map { [$0] } ?? [])).forEach { $0.draw(bg: full, bounds: ub) }
-            NSGraphicsContext.restoreGraphicsState()
-            if let i = selected, shapes.indices.contains(i) {   // seçili çizimin çerçevesi
-                let b = NSBezierPath(rect: shapes[i].bbox.insetBy(dx: -4, dy: -4))
-                b.setLineDash([3, 3], count: 2, phase: 0); b.lineWidth = 1.5; NSColor.systemBlue.setStroke(); b.stroke()
-            }
-            let border = NSBezierPath(rect: sel.insetBy(dx: -0.5, dy: -0.5))
-            border.setLineDash([4, 4], count: 2, phase: 0); NSColor.white.set(); border.stroke()
-            if sel.width > 3, sel.height > 3 {
-                for d in handleDirs {
-                    let h = handlePoint(d), r = NSRect(x: h.x - 4, y: h.y - 4, width: 8, height: 8)
-                    NSColor.white.setFill(); NSBezierPath(rect: r).fill()
-                    NSColor.systemBlue.setStroke(); let b = NSBezierPath(rect: r); b.lineWidth = 1.5; b.stroke()
-                }
-            }
+        if let i = selected, shapes.indices.contains(i) {   // seçili çizimin çerçevesi
+            let b = NSBezierPath(rect: shapes[i].bbox.insetBy(dx: -4, dy: -4))
+            b.setLineDash([3, 3], count: 2, phase: 0); b.lineWidth = 1.5; NSColor.systemBlue.setStroke(); b.stroke()
         }
-        drawLoupe(v)
         NSGraphicsContext.restoreGraphicsState()
+    }
+
+    // bir ekranın görünümüne düşen parça (piksel cinsinden kırpma; bellek paylaşılır, kopya yok)
+    func screenImage(off: NSPoint, size: NSSize) -> CGImage? {
+        guard let cg = fullCG else { return nil }
+        let all = CGRect(x: 0, y: 0, width: cg.width, height: cg.height)
+        let r = CGRect(x: off.x * scale, y: (U.height - off.y - size.height) * scale, width: size.width * scale, height: size.height * scale).integral
+        return cg.cropping(to: r.intersection(all))
     }
 
     // MARK: Büyüteç ve renk seçici
@@ -272,11 +275,19 @@ final class Session: NSObject, NSTextFieldDelegate {
         defaults.bool(forKey: "loupe") && cursor != nil && (sel.width < 3 || dragStart != nil || resizing != nil)
     }
 
-    func pixel(at c: NSPoint) -> (x: Int, y: Int, color: NSColor)? {
-        guard let rep = fullRep else { return nil }
-        let x = min(max(Int(c.x * scale), 0), rep.pixelsWide - 1)
-        let y = min(max(Int((U.height - c.y) * scale), 0), rep.pixelsHigh - 1)
-        return rep.colorAt(x: x, y: y).map { (x, y, $0) }
+    // imlecin altındaki piksel (sol-üst orijinli)
+    func pixelIndex(_ c: NSPoint) -> (x: Int, y: Int)? {
+        guard let cg = fullCG else { return nil }
+        return (min(max(Int(floor(c.x * scale)), 0), cg.width - 1), min(max(Int(floor((U.height - c.y) * scale)), 0), cg.height - 1))
+    }
+
+    func color(atX x: Int, y: Int) -> NSColor? {
+        guard let one = fullCG?.cropping(to: CGRect(x: x, y: y, width: 1, height: 1)),
+              let cs = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+        var px = [UInt8](repeating: 0, count: 4)
+        guard let ctx = CGContext(data: &px, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4, space: cs, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.draw(one, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+        return NSColor(srgbRed: CGFloat(px[0]) / 255, green: CGFloat(px[1]) / 255, blue: CGFloat(px[2]) / 255, alpha: 1)
     }
 
     func hex(_ c: NSColor) -> String {
@@ -284,49 +295,40 @@ final class Session: NSObject, NSTextFieldDelegate {
         return String(format: "#%02X%02X%02X", Int((s.redComponent * 255).rounded()), Int((s.greenComponent * 255).rounded()), Int((s.blueComponent * 255).rounded()))
     }
 
-    // (içinde bulunulan graphics context zaten birleşik yerel koordinata çevrilmiş durumda)
-    func drawLoupe(_ v: OverlayView) {
-        guard loupeVisible, let c = cursor, v.localFrame.contains(c), let px = pixel(at: c) else { return }
-        let vr = v.localFrame, n: CGFloat = 15, cell: CGFloat = 8, size = n * cell, labelH: CGFloat = 44
-        var o = NSPoint(x: c.x + 22, y: c.y - 22 - size - labelH)
-        if o.x + size > vr.maxX - 4 { o.x = c.x - 22 - size }
-        if o.y < vr.minY + 4 { o.y = c.y + 22 }
-        let box = NSRect(x: o.x, y: o.y + labelH, width: size, height: size)
-        let cx = floor(c.x * scale), cy = floor(c.y * scale)
-        let src = NSRect(x: (cx - 7) / scale, y: (cy - 7) / scale, width: n / scale, height: n / scale)
-        NSGraphicsContext.saveGraphicsState()
-        NSBezierPath(roundedRect: box, xRadius: 6, yRadius: 6).addClip()
-        NSGraphicsContext.current?.imageInterpolation = .none
-        NSColor.black.setFill(); box.fill()
-        full.draw(in: box, from: src, operation: .copy, fraction: 1)
-        NSGraphicsContext.restoreGraphicsState()
-        let cellRect = NSRect(x: box.minX + 7 * cell, y: box.minY + 7 * cell, width: cell, height: cell)
-        NSColor.black.setStroke(); NSBezierPath(rect: cellRect.insetBy(dx: -1, dy: -1)).stroke()
-        NSColor.white.setStroke(); NSBezierPath(rect: cellRect).stroke()
-        NSColor(white: 1, alpha: 0.9).setStroke(); let bd = NSBezierPath(roundedRect: box, xRadius: 6, yRadius: 6); bd.lineWidth = 2; bd.stroke()
+    // imlecin çevresindeki n x n piksel; kenara yakınsa dışarısı siyah
+    func loupeCrop(_ x: Int, _ y: Int, n: Int = 15) -> CGImage? {
+        guard let cg = fullCG else { return nil }
+        let r = CGRect(x: x - n / 2, y: y - n / 2, width: n, height: n)
+        if CGRect(x: 0, y: 0, width: cg.width, height: cg.height).contains(r) { return cg.cropping(to: r) }
+        guard let ctx = makeContext(n, n, nil) else { return nil }
+        ctx.setFillColor(NSColor.black.cgColor); ctx.fill(CGRect(x: 0, y: 0, width: n, height: n))
+        ctx.draw(cg, in: CGRect(x: -(x - n / 2), y: -(cg.height - (y - n / 2) - n), width: cg.width, height: cg.height))   // CG sol-alt orijinli
+        return ctx.makeImage()
+    }
 
-        let label = NSRect(x: o.x, y: o.y, width: size + 36, height: labelH - 6)
-        NSColor(white: 0.1, alpha: 0.92).setFill(); NSBezierPath(roundedRect: label, xRadius: 6, yRadius: 6).fill()
-        let a1: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium), .foregroundColor: NSColor.white]
-        let a2: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: NSColor(white: 0.7, alpha: 1)]
-        px.color.setFill(); NSBezierPath(roundedRect: NSRect(x: label.minX + 8, y: label.minY + 21, width: 12, height: 12), xRadius: 2, yRadius: 2).fill()
-        NSColor.white.setStroke(); NSBezierPath(roundedRect: NSRect(x: label.minX + 8, y: label.minY + 21, width: 12, height: 12), xRadius: 2, yRadius: 2).stroke()
-        (hex(px.color) as NSString).draw(at: NSPoint(x: label.minX + 26, y: label.minY + 19), withAttributes: a1)
-        ("\(px.x), \(px.y) px" as NSString).draw(at: NSPoint(x: label.minX + 8, y: label.minY + 4), withAttributes: a2)
+    func updateLoupe() {
+        guard loupeVisible, let c = cursor, let (x, y) = pixelIndex(c) else { views.forEach { $0.loupe.isHidden = true }; return }
+        let col = color(atX: x, y: y) ?? .clear, crop = loupeCrop(x, y)
         let flashing = colorFlash.map { Date().timeIntervalSince($0) < 1.2 } ?? false
-        ((flashing ? "Kopyalandı ✓" : "C: rengi kopyala") as NSString).draw(at: NSPoint(x: label.minX + 84, y: label.minY + 4),
-            withAttributes: [.font: NSFont.systemFont(ofSize: 10, weight: .semibold), .foregroundColor: flashing ? NSColor.systemGreen : NSColor(white: 0.7, alpha: 1)])
+        for v in views {
+            let l = v.loupe
+            guard v.localFrame.contains(c) else { l.isHidden = true; continue }
+            l.crop = crop; l.swatch = col; l.hexText = hex(col); l.posText = "\(x), \(y) px"; l.flashing = flashing
+            let vr = v.localFrame, w = LoupeView.w, h = LoupeView.h
+            var o = NSPoint(x: c.x + 22, y: c.y - 22 - h)
+            if o.x + w > vr.maxX - 4 { o.x = c.x - 22 - w }      // sağ kenara değerse imlecin soluna
+            if o.y < vr.minY + 4 { o.y = c.y + 22 }              // alta değerse imlecin üstüne
+            o.x = max(o.x, vr.minX + 4); o.y = min(o.y, vr.maxY - h - 4)
+            l.frame = NSRect(x: o.x - v.off.x, y: o.y - v.off.y, width: w, height: h)
+            l.isHidden = false; l.needsDisplay = true
+        }
     }
 
     func copyColor() {
-        guard let c = cursor, let px = pixel(at: c) else { return }
-        NSPasteboard.general.clearContents(); NSPasteboard.general.setString(hex(px.color), forType: .string)
-        colorFlash = Date()
-        invalidateLoupe(around: c)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.3) { [weak self] in
-            guard let self, let c = self.cursor else { return }
-            self.invalidateLoupe(around: c)
-        }
+        guard let c = cursor, let (x, y) = pixelIndex(c), let col = color(atX: x, y: y) else { return }
+        NSPasteboard.general.clearContents(); NSPasteboard.general.setString(hex(col), forType: .string)
+        colorFlash = Date(); updateLoupe()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.3) { [weak self] in self?.updateLoupe() }
     }
 
     // MARK: Tutamaçlar ve araç çubukları
@@ -359,7 +361,7 @@ final class Session: NSObject, NSTextFieldDelegate {
         guard has else { return }
         sizeLabel.stringValue = " \(Int(sel.width * scale))x\(Int(sel.height * scale)) "; sizeLabel.sizeToFit()
         place(sizeLabel, NSRect(origin: NSPoint(x: sel.minX, y: sel.maxY + 4), size: sizeLabel.frame.size))
-        let sb = sideBar.fittingSize, bb = bottomBar.fittingSize
+        let sb = sideSize, bb = bottomSize
         let side = place(sideBar, NSRect(origin: NSPoint(x: sel.maxX + 6, y: sel.maxY - sb.height), size: sb))
         var bottom = NSRect(origin: NSPoint(x: sel.maxX - bb.width, y: sel.minY - 6 - bb.height), size: bb)
         if bottom.insetBy(dx: -4, dy: -4).intersects(side) { bottom.origin.x = side.minX - 6 - bb.width }   // iki çubuk üst üste binmesin
@@ -410,33 +412,31 @@ final class Session: NSObject, NSTextFieldDelegate {
     }
 
     func mouseDragged(_ p: NSPoint) {
-        let oldCursor = cursor, oldSel = sel
         cursor = p
-        var dirty: NSRect?   // sadece değişen bölge yeniden çizilir (tam ekran 5K çizimi kare başına ~20 ms sürüyor)
         if current != nil {
             let before = current!.bbox
             if tool == .pen || tool == .marker { current!.pts.append(p) } else { current!.pts = [current!.pts[0], p] }
-            dirty = before.union(current!.bbox).insetBy(dx: -(current!.width * 4 + 24), dy: -(current!.width * 4 + 24))
+            let pad = current!.width * 4 + 24
+            shapesChanged(before.union(current!.bbox).insetBy(dx: -pad, dy: -pad))
         } else if let last = movingShape, let i = selected, shapes.indices.contains(i) {
             let before = shapes[i].bbox
             shapes[i].move(p.x - last.x, p.y - last.y); movingShape = p
-            dirty = before.union(shapes[i].bbox).insetBy(dx: -24, dy: -24)
+            shapesChanged(before.union(shapes[i].bbox).insetBy(dx: -24, dy: -24))
         } else if let d = resizing {
             var x0 = sel.minX, x1 = sel.maxX, y0 = sel.minY, y1 = sel.maxY
             if d.0 < 0 { x0 = p.x } else if d.0 > 0 { x1 = p.x }
             if d.1 < 0 { y0 = p.y } else if d.1 > 0 { y1 = p.y }
             sel = rectFrom(NSPoint(x: x0, y: y0), NSPoint(x: x1, y: y1)).intersection(ub)
-            layoutBars(); dirty = oldSel.union(sel).insetBy(dx: -16, dy: -16)
+            layoutBars(); syncChrome()
         } else if let o = moveOffset {
             // çizimler ekrana sabit kalır (bulanıklaştırma ekran pikselleriyle eşleşsin diye), sadece seçim taşınır
             sel.origin = NSPoint(x: min(max(p.x - o.x, 0), ub.maxX - sel.width), y: min(max(p.y - o.y, 0), ub.maxY - sel.height))
-            layoutBars(); dirty = oldSel.union(sel).insetBy(dx: -16, dy: -16)
+            layoutBars(); syncChrome()
         } else if let s = dragStart {
             sel = rectFrom(s, p).intersection(ub)
-            layoutBars(); dirty = oldSel.union(sel).insetBy(dx: -16, dy: -16)
+            layoutBars(); syncChrome()
         }
-        if loupeVisible { [oldCursor, p].compactMap { $0 }.forEach(invalidateLoupe) }
-        if let d = dirty { invalidate(d) } else { redraw() }
+        updateLoupe()
     }
 
     func mouseUp() {
@@ -451,13 +451,11 @@ final class Session: NSObject, NSTextFieldDelegate {
     }
 
     func mouseMoved(_ p: NSPoint) {
-        let old = cursor, oldHover = hoverRect, wasLoupe = loupeVisible
+        let oldHover = hoverRect
         cursor = p
         if sel.width < 3, dragStart == nil { hoverRect = windowRects.first { $0.contains(p) } }
-        if wasLoupe || loupeVisible { [old, p].compactMap { $0 }.forEach(invalidateLoupe) }   // seçim varken fare her oynayınca çizim yapma
-        if hoverRect != oldHover {
-            [oldHover, hoverRect].compactMap { $0 }.forEach { invalidate($0.insetBy(dx: -4, dy: -4)) }
-        }
+        if hoverRect != oldHover { syncChrome() }
+        updateLoupe()
     }
 
     func keyDown(_ e: NSEvent) {
@@ -598,21 +596,37 @@ final class Session: NSObject, NSTextFieldDelegate {
     @objc func doClose() { onAction("close", nil, nil) }
 }
 
-// Bir ekranın penceresindeki görünüm: kendi parçasını çizer, fare/klavyeyi Session'a iletir
+// Bir ekranın penceresindeki görünüm: katmanları (ekran görüntüsü, karartma/çerçeve, çizimler, büyüteç) taşır, fare/klavyeyi Session'a iletir
 final class OverlayView: NSView {
     weak var session: Session?   // zayıf: Session ↔ görünüm güçlü döngüsü her yakalamada tüm ekran görüntüsünü bellekte bırakıyordu
-    let off: NSPoint   // bu ekranın birleşik yerel koordinattaki sol-alt köşesi
+    let off: NSPoint             // bu ekranın birleşik yerel koordinattaki sol-alt köşesi
+    let chrome: ChromeView, shapesView: ShapesView, loupe: LoupeView
 
     init(frame: NSRect, session: Session, off: NSPoint) {
         self.session = session; self.off = off
+        let own = NSRect(origin: .zero, size: frame.size)
+        chrome = ChromeView(frame: own)
+        shapesView = ShapesView(frame: own, session: session, off: off)
+        loupe = LoupeView(frame: NSRect(x: 0, y: 0, width: LoupeView.w, height: LoupeView.h))
         super.init(frame: frame)
+        wantsLayer = true; layer?.backgroundColor = NSColor.black.cgColor
+        if let img = session.screenImage(off: off, size: frame.size) { addSubview(BackgroundView(frame: own, image: img, scale: session.scale)) }
+        addSubview(chrome); addSubview(shapesView)
+        loupe.isHidden = true; addSubview(loupe)
     }
     required init?(coder: NSCoder) { fatalError() }
 
     var localFrame: NSRect { NSRect(origin: off, size: bounds.size) }
     override var acceptsFirstResponder: Bool { true }
     override func resetCursorRects() { addCursorRect(bounds, cursor: .crosshair) }
-    override func draw(_ r: NSRect) { session?.draw(self) }
+
+    // Session'ın birleşik yerel koordinatındaki durumu bu ekranın katmanlarına yansıtır
+    func apply(sel: NSRect, hover: NSRect?, handles: [NSRect]) {
+        func l(_ r: NSRect) -> NSRect { r.offsetBy(dx: -off.x, dy: -off.y) }
+        let has = sel.width > 0
+        chrome.apply(sel: has ? l(sel) : nil, hover: hover.map(l), handles: handles.map(l))
+        shapesView.setMask(has ? l(sel) : nil)
+    }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -632,6 +646,120 @@ final class OverlayView: NSView {
     override func mouseUp(with e: NSEvent) { session?.mouseUp() }
     override func mouseMoved(with e: NSEvent) { session?.mouseMoved(local(e)) }
     override func keyDown(with e: NSEvent) { session?.keyDown(e) }
+}
+
+// Ekran görüntüsünün bu ekrana düşen parçası: katman içeriği olarak bir kez GPU'ya yüklenir, bir daha çizilmez
+final class BackgroundView: NSView {
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {}
+    override func hitTest(_ p: NSPoint) -> NSView? { nil }
+    init(frame: NSRect, image: CGImage, scale: CGFloat) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.contents = image; layer?.contentsGravity = .resize; layer?.contentsScale = scale
+        layer?.magnificationFilter = .nearest   // 1:1 gösterim, bulanıklaşmasın
+    }
+    required init?(coder: NSCoder) { fatalError() }
+}
+
+// Karartma (seçimin dışı), seçim çerçevesi, tutamaçlar ve pencere vurgusu: vektör katmanları, yolları güncellemek yeterli
+final class ChromeView: NSView {
+    private let dim = CAShapeLayer(), hoverL = CAShapeLayer(), edge = CAShapeLayer(), dash = CAShapeLayer(), handlesL = CAShapeLayer()
+    private var all: [CAShapeLayer] { [dim, hoverL, edge, dash, handlesL] }
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {}
+    override func hitTest(_ p: NSPoint) -> NSView? { nil }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        dim.fillRule = .evenOdd; dim.fillColor = NSColor.black.withAlphaComponent(0.45).cgColor
+        hoverL.fillColor = nil; hoverL.strokeColor = NSColor.systemBlue.cgColor; hoverL.lineWidth = 3
+        edge.fillColor = nil; edge.strokeColor = NSColor.black.withAlphaComponent(0.55).cgColor; edge.lineWidth = 1   // her zemin üstünde görünsün diye koyu alt çizgi
+        dash.fillColor = nil; dash.strokeColor = NSColor.white.cgColor; dash.lineWidth = 1; dash.lineDashPattern = [4, 4]
+        handlesL.fillColor = NSColor.white.cgColor; handlesL.strokeColor = NSColor.systemBlue.cgColor; handlesL.lineWidth = 1.5
+        for l in all { l.frame = bounds; l.contentsScale = 2; layer?.addSublayer(l) }
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        let s = window?.backingScaleFactor ?? 2
+        for l in all { l.contentsScale = s }
+    }
+
+    func apply(sel: NSRect?, hover: NSRect?, handles: [NSRect]) {
+        CATransaction.begin(); CATransaction.setDisableActions(true)   // örtük animasyon (0,25 sn kayma) olmasın
+        let p = CGMutablePath(); p.addRect(bounds)
+        if let h = sel ?? hover { p.addRect(h) }
+        dim.path = p
+        hoverL.path = (sel == nil ? hover : nil).map { CGPath(rect: $0.insetBy(dx: 1.5, dy: 1.5), transform: nil) }
+        let edgePath = sel.map { CGPath(rect: $0.insetBy(dx: -0.5, dy: -0.5), transform: nil) }
+        edge.path = edgePath; dash.path = edgePath
+        let hp = CGMutablePath(); handles.forEach { hp.addRect($0) }
+        handlesL.path = handles.isEmpty ? nil : hp
+        CATransaction.commit()
+    }
+}
+
+// Çizimler (ok, metin, bulanıklaştırma ...): sadece çizimler değişince yeniden çizilir; seçimin dışı katman maskesiyle gizlenir
+final class ShapesView: NSView {
+    weak var session: Session?
+    let off: NSPoint
+    private let maskLayer = CAShapeLayer()
+
+    init(frame: NSRect, session: Session, off: NSPoint) {
+        self.session = session; self.off = off
+        super.init(frame: frame)
+        wantsLayer = true
+        maskLayer.frame = bounds; maskLayer.fillColor = NSColor.black.cgColor
+        layer?.mask = maskLayer
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func hitTest(_ p: NSPoint) -> NSView? { nil }
+    override func draw(_ dirty: NSRect) { session?.drawShapes(offset: off) }
+
+    func setMask(_ r: NSRect?) {
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        maskLayer.path = r.map { CGPath(rect: $0, transform: nil) }
+        CATransaction.commit()
+    }
+}
+
+// Büyüteç ve renk bilgisi: küçük, kendi görünümü; her fare hareketinde sadece bu küçük alan yenilenir
+final class LoupeView: NSView {
+    static let w: CGFloat = 156, h: CGFloat = 164
+    var crop: CGImage?, swatch = NSColor.clear, hexText = "", posText = "", flashing = false
+    override func hitTest(_ p: NSPoint) -> NSView? { nil }
+
+    override func draw(_ r: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        let n: CGFloat = 15, cell: CGFloat = 8, size = n * cell, labelH: CGFloat = 44
+        let box = NSRect(x: 0, y: labelH, width: size, height: size)
+        ctx.saveGState()
+        NSBezierPath(roundedRect: box, xRadius: 6, yRadius: 6).addClip()
+        ctx.interpolationQuality = .none   // pikseller net kare görünsün
+        NSColor.black.setFill(); box.fill()
+        if let c = crop { ctx.draw(c, in: box) }
+        ctx.restoreGState()
+        let cellRect = NSRect(x: box.minX + 7 * cell, y: box.minY + 7 * cell, width: cell, height: cell)
+        NSColor.black.setStroke(); NSBezierPath(rect: cellRect.insetBy(dx: -1, dy: -1)).stroke()
+        NSColor.white.setStroke(); NSBezierPath(rect: cellRect).stroke()
+        NSColor(white: 1, alpha: 0.9).setStroke(); let bd = NSBezierPath(roundedRect: box, xRadius: 6, yRadius: 6); bd.lineWidth = 2; bd.stroke()
+
+        let label = NSRect(x: 0, y: 0, width: Self.w, height: labelH - 6)
+        NSColor(white: 0.1, alpha: 0.92).setFill(); NSBezierPath(roundedRect: label, xRadius: 6, yRadius: 6).fill()
+        let a1: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium), .foregroundColor: NSColor.white]
+        let a2: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: NSColor(white: 0.7, alpha: 1)]
+        let sw = NSRect(x: label.minX + 8, y: label.minY + 21, width: 12, height: 12)
+        swatch.setFill(); NSBezierPath(roundedRect: sw, xRadius: 2, yRadius: 2).fill()
+        NSColor.white.setStroke(); NSBezierPath(roundedRect: sw, xRadius: 2, yRadius: 2).stroke()
+        (hexText as NSString).draw(at: NSPoint(x: label.minX + 26, y: label.minY + 19), withAttributes: a1)
+        (posText as NSString).draw(at: NSPoint(x: label.minX + 8, y: label.minY + 4), withAttributes: a2)
+        ((flashing ? "Kopyalandı ✓" : "C: rengi kopyala") as NSString).draw(at: NSPoint(x: label.minX + 84, y: label.minY + 4),
+            withAttributes: [.font: NSFont.systemFont(ofSize: 10, weight: .semibold), .foregroundColor: flashing ? NSColor.systemGreen : NSColor(white: 0.7, alpha: 1)])
+    }
 }
 
 // Sağ altta çıkan yükleme bildirimi (Lightshot'taki gibi)

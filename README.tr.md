@@ -108,6 +108,7 @@ Tüm kısayollar, yükleme sitesi, link biçimi, görüntü biçimi, otomatik ka
 ```bash
 ./tests/run.sh           # AWS imza örnekleri, kaydırmalı birleştirme, OCR, bellek sızıntısı kontrolü, ...
 ./scripts/make_icon.sh   # uygulama ikonunu yeniden üret
+./scripts/release.sh     # derle, kur ve GitHub sürümü için zip üret (dist/)
 ```
 
 | Dosya | Ne yapar |
